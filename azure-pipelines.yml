@@ -1,0 +1,138 @@
+# azure-pipelines.yml
+trigger:
+  branches:
+    include:
+      - main
+
+stages:
+
+# -------- STAGE 1: BUILD --------
+- stage: Build
+  displayName: 'Build Stage'
+  jobs:
+    - job: BuildJob
+      displayName: 'Build with Gradle & SeaLights'
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+
+        - task: Checkout@1
+
+        - task: JavaToolInstaller@0
+          inputs:
+            versionSpec: '17'
+            jdkArchitecture: 'x64'
+            jdkSourceOption: 'PreInstalled'
+
+        - script: |
+            curl -s -o sealights-java-latest.zip https://agents.sealights.co/sealights-java/sealights-java-latest.zip
+            unzip -oq sealights-java-latest.zip -d ./sealights
+            rm sealights-java-latest.zip
+          displayName: 'Download SeaLights Agent'
+
+        - script: ./gradlew clean build -x test
+          displayName: 'Build with Gradle'
+
+        - script: |
+            echo $(SEALIGHTS_TOKEN) > sltoken.txt
+          displayName: 'Save SeaLights Token'
+
+        - script: |
+            java -jar ./sealights/sl-build-scanner.jar -config \
+              -tokenfile sltoken.txt \
+              -appname "swan-java-ian" \
+              -branchname "$(Build.SourceBranchName)" \
+              -buildname "$(Build.BuildId)" \
+              -pi "*com.tricentis.swan.station.*"
+          displayName: 'SeaLights: Configure'
+
+        - script: |
+            java -jar ./sealights/sl-build-scanner.jar -scan \
+              -tokenfile sltoken.txt \
+              -buildsessionidfile buildSessionId.txt \
+              -workspacepath "./build" \
+              -fi "*.class" \
+              -r
+          displayName: 'SeaLights: Scan'
+
+        - script: |
+            echo "##vso[task.setvariable variable=buildSessionId]$(cat buildSessionId.txt)"
+          displayName: 'Extract buildSessionId'
+
+        - task: PublishBuildArtifacts@1
+          inputs:
+            PathtoPublish: 'build'
+            ArtifactName: 'target'
+            publishLocation: 'Container'
+
+        - task: PublishBuildArtifacts@1
+          inputs:
+            PathtoPublish: 'sealights'
+            ArtifactName: 'sealights'
+            publishLocation: 'Container'
+
+# -------- STAGE 2: TEST --------
+- stage: Test
+  displayName: 'Run & Test Stage'
+  dependsOn: Build
+  variables:
+    SL_buildSessionId: $(buildSessionId)
+    SL_labId: swan-ian
+  jobs:
+    - job: TestJob
+      displayName: 'Run Tests in Docker Compose'
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+
+        - task: Checkout@1
+
+        - download: current
+          artifact: target
+
+        - download: current
+          artifact: sealights
+
+        - task: JavaToolInstaller@0
+          inputs:
+            versionSpec: '17'
+            jdkArchitecture: 'x64'
+            jdkSourceOption: 'PreInstalled'
+
+        - script: |
+            docker build -t swan-station .
+          displayName: 'Docker Build'
+
+        - script: |
+            sudo apt-get update
+            sudo apt-get install -y docker-compose
+          displayName: 'Install Docker Compose'
+
+        - script: |
+            echo $(SEALIGHTS_TOKEN) > sltoken.txt
+            echo $(SL_buildSessionId) > buildSessionId.txt
+            docker-compose up -d --build
+          displayName: 'Run with Docker Compose'
+
+        - script: ./gradlew test
+          displayName: 'Run Gradle Unit Tests'
+
+        - script: |
+            npm install -g @testim/testim-cli
+            testim \
+              --token $(TESTIM_PROJECT_TOKEN) \
+              --project $(TESTIM_PROJECT_ID) \
+              --host localhost \
+              --headless \
+              --mode selenium \
+              --base-url http://swan-station:9999/ \
+              --sealights-lab-id swan-ian \
+              --suite "Demo" \
+              --result-label $(Build.BuildId)
+          displayName: 'Run Testim UI Tests'
+
+        - script: |
+            docker-compose down
+          condition: always()
+          displayName: 'Stop Docker Compose'
+
